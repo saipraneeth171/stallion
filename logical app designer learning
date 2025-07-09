@@ -1,0 +1,135 @@
+{
+    "definition": {
+        "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+        "contentVersion": "1.0.0.0",
+        "triggers": {
+            "Recurrence": {
+                "type": "Recurrence",
+                "recurrence": {
+                    "interval": 3,
+                    "frequency": "Hour",
+                    "timeZone": "UTC-11",
+                    "startTime": "2025-07-08T17:00:00Z"
+                }
+            }
+        },
+        "actions": {
+            "Run_query_and_list_results": {
+                "type": "ApiConnection",
+                "inputs": {
+                    "host": {
+                        "connection": {
+                            "name": "@parameters('$connections')['azuremonitorlogs']['connectionId']"
+                        }
+                    },
+                    "method": "post",
+                    "body": "AzureDiagnostics\n",
+                    "path": "/queryData",
+                    "queries": {
+                        "subscriptions": "c83eea8e-c0d4-4483-bbad-3a30fa6043e9",
+                        "resourcegroups": "testrg",
+                        "resourcetype": "Log Analytics Workspace",
+                        "resourcename": "stallion",
+                        "timerange": "Last hour"
+                    }
+                },
+                "runAfter": {}
+            },
+            "Send_an_email_(V2)": {
+                "type": "ApiConnection",
+                "inputs": {
+                    "host": {
+                        "connection": {
+                            "name": "@parameters('$connections')['outlook-1']['connectionId']"
+                        }
+                    },
+                    "method": "post",
+                    "body": {
+                        "To": "tjeshwanth17@gmail.com",
+                        "Subject": "Regarding:Test",
+                        "Body": "<p class=\"editor-paragraph\">Hi Leo,</p><br><p class=\"editor-paragraph\">@{variables('htmlbody')}</p><br><p class=\"editor-paragraph\">Regards</p><p class=\"editor-paragraph\">saipraneeth</p>",
+                        "Cc": "saipraneeth.nan@gmail.com;",
+                        "Importance": "Normal"
+                    },
+                    "path": "/v2/Mail"
+                },
+                "runAfter": {
+                    "Append_to_string_variable": [
+                        "Succeeded"
+                    ]
+                }
+            },
+            "Initialize_variables": {
+                "type": "InitializeVariable",
+                "inputs": {
+                    "variables": [
+                        {
+                            "name": "htmlbody",
+                            "type": "string",
+                            "value": "<style>\n  table, th, td {\n    border: 1px solid #ccc;\n    border-collapse: collapse;\n    padding: 6px;\n  }\n</style>\n<table style=\"width:100%\">\n  <thead>\n    <tr>\n      <th>startTime_t</th>\n      <th>Resource</th>\n      <th>Status_s</th>\n      <th>endTime_t</th>\n    </tr>\n  </thead>\n  <tbody>"
+                        }
+                    ]
+                },
+                "runAfter": {
+                    "Run_query_and_list_results": [
+                        "Succeeded"
+                    ]
+                }
+            },
+            "Append_to_string_variable": {
+                "type": "AppendToStringVariable",
+                "inputs": {
+                    "name": "htmlbody",
+                    "value": "</tbody>\n</table>\n"
+                },
+                "runAfter": {
+                    "For_each": [
+                        "Succeeded"
+                    ]
+                }
+            },
+            "For_each": {
+                "type": "Foreach",
+                "foreach": "@body('Run_query_and_list_results')?['value']",
+                "actions": {
+                    "Append_to_string_variable_1": {
+                        "type": "AppendToStringVariable",
+                        "inputs": {
+                            "name": "htmlbody",
+                            "value": "<tr>\n  <td>@{items('For_each')?['startTime_t']}</td>\n  <td>@{items('For_each')?['Resource']}</td>\n  <td>@{items('For_each')?['Status_s']}</td>\n  <td>@{items('For_each')?['OSMajorVersion']}.@{items('For_each')?['endTime_t']}</td>\n</tr>\n"
+                        }
+                    }
+                },
+                "runAfter": {
+                    "Initialize_variables": [
+                        "Succeeded"
+                    ]
+                }
+            }
+        },
+        "outputs": {},
+        "parameters": {
+            "$connections": {
+                "type": "Object",
+                "defaultValue": {}
+            }
+        }
+    },
+    "parameters": {
+        "$connections": {
+            "type": "Object",
+            "value": {
+                "azuremonitorlogs": {
+                    "id": "/subscriptions/c83eea8e-c0d4-4483-bbad-3a30fa6043e9/providers/Microsoft.Web/locations/eastus/managedApis/azuremonitorlogs",
+                    "connectionId": "/subscriptions/c83eea8e-c0d4-4483-bbad-3a30fa6043e9/resourceGroups/testrg/providers/Microsoft.Web/connections/azuremonitorlogs",
+                    "connectionName": "azuremonitorlogs"
+                },
+                "outlook-1": {
+                    "id": "/subscriptions/c83eea8e-c0d4-4483-bbad-3a30fa6043e9/providers/Microsoft.Web/locations/eastus/managedApis/outlook",
+                    "connectionId": "/subscriptions/c83eea8e-c0d4-4483-bbad-3a30fa6043e9/resourceGroups/testrg/providers/Microsoft.Web/connections/outlook-1",
+                    "connectionName": "outlook-1"
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,135 @@
+# Databricks notebook source
+import logging
+import azure.functions as func
+from azure.storage.blob import BlobServiceClient
+from datetime import datetime, timezone
+import os
+from azure.storage.blob import BlobServiceClient
+from azure.identity import ManagedIdentityCredential
+
+azure_storage_connection_string_src = os.getenv("AZURE_STORAGE_CONNECTION_STRING") #storazdbkmldev
+azure_storage_connection_string_proc = os.getenv("de_storage_account_name") #stodemldev
+blob_url_src = f"https://{azure_storage_connection_string_src}.blob.core.windows.net"
+blob_url_proc = f"https://{azure_storage_connection_string_proc}.blob.core.windows.net"
+azure_storage_connection_string_src = (
+    "DefaultEndpointsProtocol=https;AccountName=stallion2192;"
+    "AccountKey=qnOUN3DoH5j3mb3dtUCPsI4KQedzzfbl+GtiJh1lh6ai+9AAoRcyzkWz1XbjoBlTl9rjVwuTm65L+AStYGr1LA==;EndpointSuffix=core.windows.net"
+)
+
+azure_storage_connection_string_proc = (
+    "DefaultEndpointsProtocol=https;AccountName=twitter2192;"
+    "AccountKey=BvuXZo6pE3xIRMnhPwwyjeV7KcUW6gUc/zcyZxdBXYYNjBq798iV3iJjbq2a4VK7xv7J4yYxkigJ+AStWBy3/w==;EndpointSuffix=core.windows.net"
+)
+svc_src = BlobServiceClient.from_connection_string(azure_storage_connection_string_src)
+svc_tgt = BlobServiceClient.from_connection_string(azure_storage_connection_string_proc)
+
+container_client_src = svc_src.get_container_client("src")
+container_client_proc = svc_tgt.get_container_client("tgt")
+# container_src = 'src'
+# container_proc = 'tgt'
+# credential = ManagedIdentityCredential()
+# blob_service_client_src = BlobServiceClient(account_url=blob_url_src,credential=credential)
+# blob_service_client_proc = BlobServiceClient(account_url=blob_url_proc,credential=credential)
+# container_client_src = blob_service_client_src.get_container_client(container_src)
+# container_client_proc = blob_service_client_proc.get_container_client(container_proc)
+current_datetime = datetime.now()
+
+
+app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
+
+@app.route(route="sunlife_http")
+def sunlife_http(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        logging.info('Processing HTTP request.')
+
+        # Extract query parameters
+        folderpath = req.params.get('folderpath')
+        filename = req.params.get('filename')
+
+        logging.info(f"Received folderpath: {folderpath}, filename: {filename}")
+
+        if not folderpath or not filename:
+            return func.HttpResponse(
+                "Please pass 'folderpath' and 'filename' in the query string",
+                status_code=400
+            )
+
+        # Helper functions
+        def blob_exists(blob_name,container_client):
+            try:
+                container_client.get_blob_client(blob_name).get_blob_properties()
+                logging.info(f"Blob exists: {blob_name}")
+                return True
+            except Exception as e:
+                logging.warning(f"Blob does not exist: {blob_name}. Reason: {str(e)}")
+                return False
+
+        def copy_blob(src_blob_name, dest_blob_name,src_container_client,dest_container_client):
+            try:
+                src_blob_url = src_container_client.get_blob_client(src_blob_name).url
+                dest_blob_client = dest_container_client.get_blob_client(dest_blob_name)
+                dest_blob_client.start_copy_from_url(src_blob_url)
+                logging.info(f"Copied blob from {src_blob_name} to {dest_blob_name}")
+            except Exception as e:
+                logging.error(f"Failed to copy blob from {src_blob_name} to {dest_blob_name}: {str(e)}")
+
+        def move_blob(src_blob_name, dest_blob_name,src_container_client,dest_container_client):
+            copy_blob(src_blob_name, dest_blob_name,src_container_client,dest_container_client)
+            try:
+                src_container_client.delete_blob(src_blob_name)
+                logging.info(f"Deleted original blob after copy: {src_blob_name}")
+            except Exception as e:
+                logging.error(f"Failed to delete blob {src_blob_name}: {str(e)}")
+
+        def delete_blob(blob_name,container_client):
+            try:
+                container_client.delete_blob(blob_name)
+                logging.info(f"Deleted blob: {blob_name}")
+            except Exception as e:
+                logging.error(f"Failed to delete blob {blob_name}: {str(e)}")
+        global path,temp,processed,enrollment_path,processed_files,temp_files,blob_client,properties,modification_datetime
+        path = 'uploads/'+filename
+        temp = 'uploads/temp/'+filename
+        processed = 'uploads/processed/'+filename
+        enrollment_path = 'deidentified/'+filename
+        processed_files = blob_exists(processed,container_client_src)
+        temp_files = blob_exists(temp,container_client_src)
+        logging.error(f"blob names assigned")
+
+        if temp_files:
+            blob_client = container_client_src.get_blob_client(blob=temp)
+            properties = blob_client.get_blob_properties()
+            modification_datetime = properties.last_modified
+
+        if folderpath =='uploads/':
+        
+            if blob_exists(path,container_client_src):
+                copy_blob(path, enrollment_path,container_client_src,container_client_proc)
+                move_blob(path,temp,container_client_src,container_client_src)
+                return func.HttpResponse('0', status_code=200)
+        
+        elif folderpath == 'outbound/':
+        
+            if temp_files:
+                move_blob(temp,processed,container_client_src,container_client_src)
+                # delete_blob(temp,container_client_src)
+                return func.HttpResponse('3', status_code=200)
+        
+        elif folderpath == '':
+        
+            if (temp_files == False) and (processed_files == False):
+                if current_datetime.day > 7 :
+                    return func.HttpResponse('1', status_code=200)
+        
+            if temp_files and (processed_files == False):
+                if ( (modification_datetime.day+ 7 ) > current_datetime.day ) :
+                    return func.HttpResponse('2', status_code=200)
+        
+            elif processed_files:
+               return func.HttpResponse('already processed', status_code=200)
+
+        return func.HttpResponse("No action taken", status_code=200)
+
+    except Exception as e:
+        logging.exception("Unhandled error occurred")
+        return func.HttpResponse(f"Internal Server Error: {str(e)}", status_code=500)

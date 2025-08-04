@@ -1,0 +1,274 @@
+# import azure.functions as func
+# import logging
+
+# app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
+
+# @app.route(route="http_trigger")
+# def http_trigger(req: func.HttpRequest) -> func.HttpResponse:
+#     logging.info('Python HTTP trigger function processed a request.')
+
+#     name = req.params.get('name')
+#     if not name:
+#         try:
+#             req_body = req.get_json()
+#         except ValueError:
+#             pass
+#         else:
+#             name = req_body.get('name')
+
+#     if name:
+#         return func.HttpResponse(f"Hello, {name}. This HTTP triggered function executed successfully.")
+#     else:
+#         return func.HttpResponse(
+#              "This HTTP triggered function executed successfully. Pass a name in the query string or in the request body for a personalized response.",
+#              status_code=200
+#         )
+
+# import logging
+# import azure.functions as func
+# from azure.storage.blob import BlobServiceClient
+# from datetime import datetime, timezone
+
+# def main(req: func.HttpRequest) -> func.HttpResponse:
+#     logging.info('Processing HTTP request.')
+
+#     # Extract parameters from the query string or request body
+#     folderpath = req.params.get('folderpath')
+#     filename = req.params.get('filename')
+#     if not folderpath or not filename:
+#         return func.HttpResponse(
+#             "Please pass 'folderpath' and 'filename' in the query string",
+#             status_code=400
+#         )
+
+#     # Initialize BlobServiceClient
+#     conn_str = "DefaultEndpointsProtocol=https;AccountName=stallion2192;AccountKey=qnOUN3DoH5j3mb3dtUCPsI4KQedzzfbl+GtiJh1lh6ai+9AAoRcyzkWz1XbjoBlTl9rjVwuTm65L+AStYGr1LA==;EndpointSuffix=core.windows.net"
+#     blob_service_client = BlobServiceClient.from_connection_string(conn_str)
+#     container_name = "jerry"  # Adjust as necessary
+#     container_client = blob_service_client.get_container_client(container_name)
+
+#     # Define blob paths
+#     path_blob = f"{folderpath}{filename}"
+#     temp_blob = f"{folderpath}temp/{filename}"
+#     processed_blob = f"{folderpath}processed/{filename}"
+#     enrollment_blob = f"enrollment/{filename}"
+
+#     # Helper functions
+#     def blob_exists(blob_name):
+#         try:
+#             container_client.get_blob_client(blob_name).get_blob_properties()
+#             return True
+#         except:
+#             return False
+
+#     def copy_blob(src_blob_name, dest_blob_name):
+#         src_blob_url = container_client.get_blob_client(src_blob_name).url
+#         dest_blob_client = container_client.get_blob_client(dest_blob_name)
+#         dest_blob_client.start_copy_from_url(src_blob_url)
+
+#     def move_blob(src_blob_name, dest_blob_name):
+#         copy_blob(src_blob_name, dest_blob_name)
+#         container_client.delete_blob(src_blob_name)
+
+#     def delete_blob(blob_name):
+#         container_client.delete_blob(blob_name)
+
+#     # Processing logic
+#     current_datetime = datetime.now(timezone.utc)
+#     if folderpath == "thing/uploads/":
+#         if blob_exists(path_blob):
+#             copy_blob(path_blob, enrollment_blob)
+#             move_blob(path_blob, temp_blob)
+
+#     elif folderpath == "enrollment/":
+#         if blob_exists(temp_blob):
+#             move_blob(temp_blob, processed_blob)
+#             delete_blob(temp_blob)
+#             return func.HttpResponse("Processed successfully", status_code=200)
+
+#     elif folderpath == "":
+#         if not blob_exists(temp_blob) and not blob_exists(processed_blob):
+#             if current_datetime.day > 7:
+#                 return func.HttpResponse("No files to process", status_code=200)
+#         if blob_exists(temp_blob) and not blob_exists(processed_blob):
+#             # Check last modified time
+#             return func.HttpResponse("Processing in progress", status_code=200)
+
+#     return func.HttpResponse("No action taken", status_code=200)
+# def main(req: func.HttpRequest) -> func.HttpResponse:
+#     logging.info('Processing HTTP request.')
+
+#     # Extract parameters
+#     folderpath = req.params.get('folderpath')
+#     filename = req.params.get('filename')
+
+#     logging.info(f"Received folderpath: '{folderpath}', filename: '{filename}'")
+
+#     if not folderpath or not filename:
+#         return func.HttpResponse(
+#             "Please pass 'folderpath' and 'filename' in the query string",
+#             status_code=400
+#         )
+
+#     # Normalize folderpath
+#     folderpath = folderpath.strip().rstrip('/') + '/'  # ensures it ends with exactly one slash
+
+#     # Init BlobServiceClient
+#     conn_str = "DefaultEndpointsProtocol=https;AccountName=stallion2192;AccountKey=qnOUN3DoH5j3mb3dtUCPsI4KQedzzfbl+GtiJh1lh6ai+9AAoRcyzkWz1XbjoBlTl9rjVwuTm65L+AStYGr1LA==;EndpointSuffix=core.windows.net"
+#     blob_service_client = BlobServiceClient.from_connection_string(conn_str)
+#     container_name = "jerry"
+#     container_client = blob_service_client.get_container_client(container_name)
+
+#     path_blob = f"{folderpath}{filename}"
+#     temp_blob = f"{folderpath}temp/{filename}"
+#     processed_blob = f"{folderpath}processed/{filename}"
+#     enrollment_blob = f"enrollment/{filename}"
+
+#     # Helpers
+#     def blob_exists(blob_name):
+#         try:
+#             container_client.get_blob_client(blob_name).get_blob_properties()
+#             return True
+#         except Exception as e:
+#             logging.warning(f"Blob check failed for {blob_name}: {e}")
+#             return False
+
+#     def copy_blob(src_blob_name, dest_blob_name):
+#         src_blob_url = container_client.get_blob_client(src_blob_name).url
+#         dest_blob_client = container_client.get_blob_client(dest_blob_name)
+#         dest_blob_client.start_copy_from_url(src_blob_url)
+
+#     def move_blob(src_blob_name, dest_blob_name):
+#         copy_blob(src_blob_name, dest_blob_name)
+#         container_client.delete_blob(src_blob_name)
+
+#     def delete_blob(blob_name):
+#         container_client.delete_blob(blob_name)
+
+#     # Logic
+#     current_datetime = datetime.now(timezone.utc)
+
+#     if folderpath == "thing/uploads/":
+#         logging.info("Processing thing/uploads/")
+#         if blob_exists(path_blob):
+#             copy_blob(path_blob, enrollment_blob)
+#             move_blob(path_blob, temp_blob)
+#             return func.HttpResponse("Moved to enrollment and temp", status_code=200)
+
+#     elif folderpath == "enrollment/":
+#         logging.info("Processing enrollment/")
+#         if blob_exists(temp_blob):
+#             move_blob(temp_blob, processed_blob)
+#             delete_blob(temp_blob)
+#             return func.HttpResponse("Processed successfully", status_code=200)
+
+#     elif folderpath == "":
+#         logging.info("Empty folderpath logic")
+#         if not blob_exists(temp_blob) and not blob_exists(processed_blob):
+#             if current_datetime.day > 7:
+#                 return func.HttpResponse("No files to process", status_code=200)
+#         if blob_exists(temp_blob) and not blob_exists(processed_blob):
+#             return func.HttpResponse("Processing in progress", status_code=200)
+
+#     return func.HttpResponse("No action taken", status_code=200)
+import logging
+import azure.functions as func
+from azure.storage.blob import BlobServiceClient
+from datetime import datetime, timezone
+
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        logging.info('Processing HTTP request.')
+
+        # Extract query parameters
+        folderpath = req.params.get('folderpath')
+        filename = req.params.get('filename')
+
+        logging.info(f"Received folderpath: {folderpath}, filename: {filename}")
+
+        if not folderpath or not filename:
+            return func.HttpResponse(
+                "Please pass 'folderpath' and 'filename' in the query string",
+                status_code=400
+            )
+
+        # Initialize BlobServiceClient
+        conn_str = "DefaultEndpointsProtocol=https;AccountName=stallion2192;AccountKey=qnOUN3DoH5j3mb3dtUCPsI4KQedzzfbl+GtiJh1lh6ai+9AAoRcyzkWz1XbjoBlTl9rjVwuTm65L+AStYGr1LA==;EndpointSuffix=core.windows.net"  # Secure this via environment variables or Azure Key Vault
+        blob_service_client = BlobServiceClient.from_connection_string(conn_str)
+        container_name = "jerry"
+        container_client = blob_service_client.get_container_client(container_name)
+
+        # Blob paths
+        path_blob = f"{folderpath}{filename}"
+        temp_blob = f"{folderpath}temp/{filename}"
+        processed_blob = f"{folderpath}processed/{filename}"
+        enrollment_blob = f"enrollment/{filename}"
+
+        # Helper functions
+        def blob_exists(blob_name):
+            try:
+                container_client.get_blob_client(blob_name).get_blob_properties()
+                logging.info(f"Blob exists: {blob_name}")
+                return True
+            except Exception as e:
+                logging.warning(f"Blob does not exist: {blob_name}. Reason: {str(e)}")
+                return False
+
+        def copy_blob(src_blob_name, dest_blob_name):
+            try:
+                src_blob_url = container_client.get_blob_client(src_blob_name).url
+                dest_blob_client = container_client.get_blob_client(dest_blob_name)
+                dest_blob_client.start_copy_from_url(src_blob_url)
+                logging.info(f"Copied blob from {src_blob_name} to {dest_blob_name}")
+            except Exception as e:
+                logging.error(f"Failed to copy blob from {src_blob_name} to {dest_blob_name}: {str(e)}")
+
+        def move_blob(src_blob_name, dest_blob_name):
+            copy_blob(src_blob_name, dest_blob_name)
+            try:
+                container_client.delete_blob(src_blob_name)
+                logging.info(f"Deleted original blob after copy: {src_blob_name}")
+            except Exception as e:
+                logging.error(f"Failed to delete blob {src_blob_name}: {str(e)}")
+
+        def delete_blob(blob_name):
+            try:
+                container_client.delete_blob(blob_name)
+                logging.info(f"Deleted blob: {blob_name}")
+            except Exception as e:
+                logging.error(f"Failed to delete blob {blob_name}: {str(e)}")
+
+        # Processing logic
+        current_datetime = datetime.now(timezone.utc)
+
+        if folderpath == "thing/uploads/":
+            if blob_exists(path_blob):
+                copy_blob(path_blob, enrollment_blob)
+                move_blob(path_blob, temp_blob)
+                return func.HttpResponse("Upload processed", status_code=200)
+            else:
+                return func.HttpResponse("Upload blob does not exist", status_code=404)
+
+        elif folderpath == "enrollment/":
+            if blob_exists(temp_blob):
+                move_blob(temp_blob, processed_blob)
+                delete_blob(temp_blob)
+                return func.HttpResponse("Enrollment processed", status_code=200)
+            else:
+                return func.HttpResponse("Enrollment blob not found", status_code=404)
+
+        elif folderpath == "":
+            if not blob_exists(temp_blob) and not blob_exists(processed_blob):
+                if current_datetime.day > 7:
+                    return func.HttpResponse("No files to process", status_code=200)
+            if blob_exists(temp_blob) and not blob_exists(processed_blob):
+                # More detailed logic can be added here
+                return func.HttpResponse("Processing in progress", status_code=200)
+
+        return func.HttpResponse("No action taken", status_code=200)
+
+    except Exception as e:
+        logging.exception("Unhandled error occurred")
+        return func.HttpResponse(f"Internal Server Error: {str(e)}", status_code=500)
+# Note: Replace <your_connection_string> with your actual Azure Storage connection string.
+# Ensure to secure sensitive information like connection strings using environment variables or Azure Key Vault.

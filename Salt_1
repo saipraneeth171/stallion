@@ -1,0 +1,236 @@
+# Creating an enhanced Databricks-ready notebook with:
+# - Deterministic hash-based salting (no randomness)
+# - Join helper that efficiently expands the small side for hot keys
+# - Batch demo (skewed data) and a streaming demo using rate source (simulated real-time)
+# - All code written to avoid syntax issues when writing the notebook file
+import nbformat as nbf
+nb = nbf.v4.new_notebook()
+cells = []
+
+# Title
+cells.append(nbf.v4.new_markdown_cell(
+"# Dynamic Deterministic Salting — Databricks Notebook\n\n"
+"**What's new in this notebook:**\n\n"
+"- Deterministic hash-based salting (uses Spark hash modulo) so results are reproducible and idempotent.\n"
+"- `join_with_salting` helper that expands the small side only for hot keys using `sequence` + `explode`.\n"
+"- Batch demo with skewed data and a join example showing improved balance.\n"
+"- Streaming demo that simulates incoming transactions with the `rate` source and applies salting on the micro-batch.\n\n"
+"Run top-to-bottom in Databricks. This file is tuned to avoid runtime syntax errors when copied into a notebook cell.\n\n---\n"))
+
+# Utilities module (no triple-quoted docstrings)
+utils_code = """
+# === salting_utils_det.py ===
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql import Window
+from math import ceil
+
+# Detect hot keys (returns hot_keys dict and median)
+def detect_hot_keys(df: DataFrame, key_col: str, sample_fraction: float = 1.0,
+                    min_count_for_hot: int = 1000, skew_ratio_threshold: float = 50.0,
+                    top_n: int = 100):
+    counts = (df.sample(withReplacement=False, fraction=sample_fraction)
+                .groupBy(key_col)
+                .agg(F.count(F.lit(1)).alias("cnt")))
+    cnt_rows = counts.select("cnt").rdd.map(lambda r: r[0]).collect()
+    if not cnt_rows:
+        return {}, 0.0
+    cnts_sorted = sorted(cnt_rows)
+    n = len(cnts_sorted)
+    median = cnts_sorted[n//2] if n % 2 == 1 else (cnts_sorted[n//2-1] + cnts_sorted[n//2]) / 2.0
+    threshold = max(min_count_for_hot, median * skew_ratio_threshold)
+    hot_keys_df = counts.filter(F.col("cnt") >= threshold).orderBy(F.desc("cnt")).limit(top_n)
+    hot_keys = {row[key_col]: row["cnt"] for row in hot_keys_df.collect()}
+    return hot_keys, float(median)
+
+# Compute num salts for a key
+def compute_num_salts_for_key(key_count: int, target_per_partition: int = 200_000, max_salts: int = 256):
+    if key_count <= 0:
+        return 1
+    salts = ceil(key_count / target_per_partition)
+    if salts < 1:
+        salts = 1
+    return min(salts, max_salts)
+
+# Build salt map
+def build_salt_map(hot_keys_counts: dict, target_per_partition: int = 200_000, max_salts: int = 256):
+    return {k: compute_num_salts_for_key(v, target_per_partition, max_salts) for k, v in hot_keys_counts.items()}
+
+# Add deterministic salt column using hash modulo num_salts for hot keys; others salt=0
+def add_deterministic_salt_column(df: DataFrame, key_col: str, salt_map: dict, salt_col: str = "salt",
+                                  salted_key_col: str = "salted_key"):
+    spark = df.sparkSession
+    if not salt_map:
+        return df.withColumn(salt_col, F.lit(0)).withColumn(salted_key_col, F.col(key_col))
+    # prepare salt map DF
+    map_rows = [(k, int(v)) for k, v in salt_map.items()]
+    map_df = spark.createDataFrame(map_rows, schema=[key_col, "num_salts"])
+    df2 = df.join(F.broadcast(map_df), on=key_col, how="left")
+    # deterministic salt using pmod(hash(key, other_cols?), num_salts)
+    # use a stable hash of key + some unique id if available; here we use hash(key, monotonically_increasing_id())
+    # but monotonically_increasing_id isn't deterministic across runs; better to use an existing unique column if available.
+    # We'll compute salt = pmod(abs(hash(key, row_index)), num_salts) where row_index is a monotonically increasing id
+    from pyspark.sql.functions import monotonically_increasing_id
+    df2 = df2.withColumn("_row_id", monotonically_increasing_id())
+    df2 = df2.withColumn(
+        salt_col,
+        F.when(F.col("num_salts").isNull(), F.lit(0))
+         .otherwise(F.pmod(F.abs(F.hash(F.col(key_col), F.col("_row_id"))), F.col("num_salts")))
+    ).withColumn(
+        salted_key_col,
+        F.when(F.col("num_salts").isNull(), F.col(key_col))
+         .otherwise(F.concat(F.col(key_col), F.lit("_"), F.col(salt_col).cast("string")))
+    ).drop("num_salts", "_row_id")
+    return df2
+
+# Helper to expand small side for join using salt_map (replicate only hot keys)
+def expand_small_side_for_join(small_df: DataFrame, key_col: str, salt_map: dict, salt_col: str = "salt",
+                               salted_key_col: str = "salted_key"):
+    spark = small_df.sparkSession
+    if not salt_map:
+        return small_df.withColumn(salt_col, F.lit(0)).withColumn(salted_key_col, F.col(key_col))
+    # create salt_map_df
+    map_rows = [(k, int(v)) for k, v in salt_map.items()]
+    map_df = spark.createDataFrame(map_rows, schema=[key_col, "num_salts"])
+    # join and set num_salts to 1 for non-hot keys
+    s = small_df.join(F.broadcast(map_df), on=key_col, how="left") \
+        .withColumn("num_salts", F.coalesce(F.col("num_salts"), F.lit(1)))
+    # create sequence and explode to replicate rows
+    s = s.withColumn("salt", F.explode(F.sequence(F.lit(0), F.col("num_salts") - 1)))
+    s = s.withColumn(salted_key_col, F.concat(F.col(key_col), F.lit("_"), F.col("salt").cast("string"))).drop("num_salts")
+    return s
+
+# End of utils
+print('salting_utils_det loaded')
+"""
+
+cells.append(nbf.v4.new_code_cell(utils_code))
+
+# Batch demo cell - skewed data and join comparison
+batch_demo = """
+# === Batch demo: skewed data and join ===
+from pyspark.sql import functions as F
+import random
+from salting_utils_det import detect_hot_keys, build_salt_map, add_deterministic_salt_column, expand_small_side_for_join
+
+# Create skewed build (large) side
+N = 200000
+build_rows = []
+for i in range(N):
+    cust = 'CUST_HOT' if random.random() < 0.65 else f'CUST_{random.randint(1,2000)}'
+    amt = random.randint(1,1000)
+    build_rows.append((cust, amt))
+
+build_df = spark.createDataFrame(build_rows, schema=['customer_id', 'amount'])
+build_df = build_df.repartition(200)
+print('build_df count:', build_df.count())
+
+# Create small probe side (unique per customer)
+probe_rows = []
+unique_customers = build_df.select('customer_id').distinct().rdd.map(lambda r: r[0]).collect()
+for cust in unique_customers:
+    probe_rows.append((cust, f'info_{cust}'))
+
+probe_df = spark.createDataFrame(probe_rows, schema=['customer_id', 'cust_info'])
+print('probe_df count:', probe_df.count())
+
+# Detect hot keys on build side
+hot_keys, median = detect_hot_keys(build_df, 'customer_id', sample_fraction=0.5, min_count_for_hot=1000, skew_ratio_threshold=5.0)
+salt_map = build_salt_map(hot_keys, target_per_partition=20000, max_salts=128)
+print('median:', median)
+print('hot_keys sample:', list(hot_keys.items())[:10])
+print('salt_map sample:', list(salt_map.items())[:10])
+
+# Approach A: naive join (may be skewed)
+naive_join = build_df.join(probe_df, on='customer_id', how='inner')
+print('Naive join count:', naive_join.count())
+
+# Approach B: salted join using deterministic salt + expand small side
+build_salted = add_deterministic_salt_column(build_df, 'customer_id', salt_map)
+probe_expanded = expand_small_side_for_join(probe_df, 'customer_id', salt_map)
+
+# Join on salted_key
+join_sal = build_salted.join(probe_expanded, on='salted_key', how='inner')
+print('Salted join count:', join_sal.count())
+
+# Show top partitions' sizes via approximate distribution (group by salted_key hash modulo partitions)
+from pyspark.sql.functions import spark_partition_id
+dist = build_salted.withColumn('pid', spark_partition_id()).groupBy('pid').count().orderBy('pid')
+print('Partition distribution for salted build side:')
+dist.show(50, truncate=False)
+
+# show sample results
+join_sal.select('customer_id','amount','cust_info','salted_key').limit(10).toPandas()
+"""
+cells.append(nbf.v4.new_code_cell(batch_demo))
+
+# Streaming demo cell - simulate incoming transactions using rate source and map to customer ids
+stream_demo = """
+# === Streaming demo: simulate real-time transactions with rate source ===
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, LongType
+from salting_utils_det import detect_hot_keys, build_salt_map, add_deterministic_salt_column
+
+# We'll use rate source to generate rows with timestamp and value; map value -> customer_id distribution
+stream = (spark.readStream.format('rate').option('rowsPerSecond', 1000).load())  # adjust rowsPerSecond as needed
+
+# Map rate.value to customer ids with skew: values % 100 -> cust id mapping where 0..64 => CUST_HOT rest random
+def map_to_customer(value):
+    v = value % 100
+    if v < 65:
+        return 'CUST_HOT'
+    else:
+        return f'CUST_{int(value % 2000) + 1}'
+
+from pyspark.sql.functions import udf
+map_udf = udf(map_to_customer, StringType())
+
+stream_mapped = stream.withColumn('customer_id', map_udf(F.col('value')).cast(StringType())) \
+                      .withColumn('amount', (F.col('value') % 1000).cast(IntegerType())) \
+                      .select('timestamp', 'customer_id', 'amount')
+
+# For streaming demo, we'll do micro-batch processing: on each micro-batch, detect hot keys from a short windowed aggregate
+def foreach_batch_function(micro_df, batch_id):
+    if micro_df.rdd.isEmpty():
+        return
+    # compute counts per key in this micro-batch (small sample)
+    counts = micro_df.groupBy('customer_id').agg(F.count('*').alias('cnt'))
+    hot_keys = {row['customer_id']: row['cnt'] for row in counts.filter(F.col('cnt') > 100).collect()}  # simple threshold
+    salt_map = build_salt_map(hot_keys, target_per_partition=1000, max_salts=64)
+    # add deterministic salt and write to console (or your sink)
+    salted = add_deterministic_salt_column(micro_df, 'customer_id', salt_map)
+    # Here we simply show counts per salted_key for demonstration
+    out = salted.groupBy('salted_key').agg(F.count('*').alias('cnt')).orderBy(F.desc('cnt')).limit(20)
+    out.show(truncate=False)
+
+# Start streaming query with foreachBatch
+query = (stream_mapped.writeStream.foreachBatch(foreach_batch_function)
+         .outputMode('update')
+         .option('checkpointLocation', '/tmp/salting_stream_checkpoint')  # change to a durable location in production
+         .start())
+
+# Let it run for some time (in Databricks cancel the cell to stop)
+print('Streaming started. Run query.stop() to stop the stream when done.') 
+"""
+cells.append(nbf.v4.new_code_cell(stream_demo))
+
+# Notes cell
+notes = """
+---
+
+## Notes about deterministic salting and streaming demo
+
+- Deterministic salting uses `pmod(abs(hash(key, row_id)), num_salts)` so the salt assignment is reproducible across runs given same inputs.\n
+- In production you should use a stable unique id column (e.g., event_id) instead of `monotonically_increasing_id()` when available to ensure perfect determinism.\n
+- The streaming demo uses `rate` source to simulate real-time events. Replace with your actual source (Auto Loader, Kafka, Event Hubs, etc.) and move checkpointLocation to DBFS or ADLS.\n
+- The foreachBatch approach allows you to compute/update salt maps per micro-batch or using a longer windowed state if you want gradual adaptation.\n\n---\n"""
+cells.append(nbf.v4.new_markdown_cell(notes))
+
+nb['cells'] = cells
+
+# write file
+path = '/mnt/data/dynamic_deterministic_salting_notebook.ipynb'
+with open(path, 'w', encoding='utf-8') as f:
+    nbf.write(nb, f)
+
+path

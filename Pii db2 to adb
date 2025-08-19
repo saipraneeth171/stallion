@@ -1,0 +1,169 @@
+# Databricks Notebook: DB2 to ADLS with PII Validation, Masking, and Audit Logging
+
+from pyspark.sql.functions import (
+    col, sha2, lit, regexp_replace, concat, current_timestamp, length, when
+)
+from pyspark.sql import Row
+
+# ============================
+# 1. JDBC CONNECTION DETAILS
+# ============================
+
+jdbc_url = "jdbc:db2://<db2-host>:50000/<db-name>"
+db2_table = "CUSTOMER_DATA"
+user = dbutils.secrets.get("db2_scope", "db2_user")
+password = dbutils.secrets.get("db2_scope", "db2_password")
+driver = "com.ibm.db2.jcc.DB2Driver"
+
+# ============================
+# 2. INGEST RAW DATA FROM DB2 (LANDING/BRONZE)
+# ============================
+
+df_raw = (
+    spark.read.format("jdbc")
+    .option("url", jdbc_url)
+    .option("dbtable", db2_table)
+    .option("user", user)
+    .option("password", password)
+    .option("driver", driver)
+    .load()
+)
+
+landing_path = "abfss://landing@<storageaccount>.dfs.core.windows.net/db2/customer_data_raw"
+(
+    df_raw.write.format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save(landing_path)
+)
+
+# ============================
+# 3. DEFINE PII RULES
+# ============================
+
+pii_rules = {
+    "EMAIL": "mask_domain",
+    "SSN": "hash",
+    "PHONE": "mask_last4",
+    "DOB": "redact",
+    "ADDRESS": "tokenize_deterministic"
+}
+
+# ============================
+# 4. VALIDATION LOGIC
+# ============================
+
+def validate_pii(df, column, rule):
+    """Return validation status for a given column & rule."""
+    if rule == "mask_domain":
+        return df.withColumn("is_valid_" + column, col(column).rlike(r"^[^@]+@[^@]+\.[^@]+$"))
+    elif rule == "hash":  # SSN expected 9 digits
+        return df.withColumn("is_valid_" + column, length(col(column)) == 9)
+    elif rule == "mask_last4":  # phone expected >= 10 digits
+        return df.withColumn("is_valid_" + column, length(col(column)) >= 10)
+    elif rule == "redact":
+        return df.withColumn("is_valid_" + column, lit(True))  # always valid
+    elif rule == "tokenize_deterministic":
+        return df.withColumn("is_valid_" + column, col(column).isNotNull())
+    else:
+        return df.withColumn("is_valid_" + column, lit(True))
+
+# Apply validation to all PII columns
+df_validated = df_raw
+for col_name, rule in pii_rules.items():
+    if col_name in df_raw.columns:
+        df_validated = validate_pii(df_validated, col_name, rule)
+
+# ============================
+# 5. APPLY MASKING FUNCTION
+# ============================
+
+def apply_pii_rules(df, rules):
+    for column, action in rules.items():
+        if column not in df.columns:
+            continue
+        if action == "hash":
+            df = df.withColumn(column, sha2(col(column).cast("string"), 256))
+        elif action == "mask_last4":
+            df = df.withColumn(column, concat(lit("XXXXXX"), col(column).substr(-4, 4)))
+        elif action == "mask_domain":
+            df = df.withColumn(column, regexp_replace(col(column), r"(^[^@]+)", "***"))
+        elif action == "redact":
+            df = df.withColumn(column, lit(None))
+        elif action == "tokenize_deterministic":
+            df = df.withColumn(column, sha2(col(column).cast("string"), 256))
+    return df
+
+df_masked = apply_pii_rules(df_validated, pii_rules)
+
+# ============================
+# 6. SPLIT VALID vs INVALID RECORDS
+# ============================
+
+# Check if all validation columns are true
+valid_condition = " AND ".join([f"is_valid_{c}" for c in pii_rules.keys() if f"is_valid_{c}" in df_masked.columns])
+
+df_valid = df_masked.filter(valid_condition)
+df_invalid = df_masked.filter(f"NOT ({valid_condition})")
+
+# ============================
+# 7. WRITE SILVER (VALID MASKED DATA)
+# ============================
+
+silver_path = "abfss://silver@<storageaccount>.dfs.core.windows.net/db2/customer_data_curated"
+(
+    df_valid.write.format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save(silver_path)
+)
+
+# ============================
+# 8. WRITE QUARANTINE (INVALID DATA)
+# ============================
+
+quarantine_path = "abfss://quarantine@<storageaccount>.dfs.core.windows.net/db2/customer_data_invalid"
+(
+    df_invalid.write.format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .save(quarantine_path)
+)
+
+# ============================
+# 9. AUDIT LOGGING (with validation status)
+# ============================
+
+audit_data = []
+for col_name, rule in pii_rules.items():
+    if f"is_valid_{col_name}" in df_masked.columns:
+        valid_count = df_masked.filter(col(f"is_valid_{col_name}") == True).count()
+        invalid_count = df_masked.filter(col(f"is_valid_{col_name}") == False).count()
+        audit_data.append(Row(
+            table_name=db2_table,
+            column_name=col_name,
+            masking_rule=rule,
+            valid_records=valid_count,
+            invalid_records=invalid_count,
+            process_time=str(current_timestamp())
+        ))
+
+df_audit = spark.createDataFrame(audit_data)
+
+audit_table_path = "abfss://audit@<storageaccount>.dfs.core.windows.net/pii_audit_log"
+(
+    df_audit.write.format("delta")
+    .mode("append")
+    .save(audit_table_path)
+)
+
+# ============================
+# 10. VALIDATION OUTPUT
+# ============================
+
+print("✅ Raw PII data written to Landing:", landing_path)
+print("✅ Masked curated data written to Silver:", silver_path)
+print("✅ Invalid records written to Quarantine:", quarantine_path)
+print("✅ Audit log written to:", audit_table_path)
+
+display(df_audit)
